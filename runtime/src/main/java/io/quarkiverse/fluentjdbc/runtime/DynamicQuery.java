@@ -7,16 +7,17 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
-import static io.quarkiverse.fluentjdbc.runtime.QueryOperator.AND;
-import static io.quarkiverse.fluentjdbc.runtime.QueryOperator.COMMA;
-import static io.quarkiverse.fluentjdbc.runtime.QueryParamNamer.UNNUMBERED;
-import static java.lang.Math.max;
+import static com.bmwgroup.fs.fleetreporting.queryservice.panache.QueryOperator.AND;
+import static com.bmwgroup.fs.fleetreporting.queryservice.panache.QueryOperator.COMMA;
+import static com.bmwgroup.fs.fleetreporting.queryservice.panache.QueryParamNamer.NUMBERED;
 
 /**
  * <p>
@@ -35,15 +36,18 @@ import static java.lang.Math.max;
  */
 @RegisterForReflection
 public class DynamicQuery {
-    // e.g. just "name" without " = :name"
-    private static final String UNNAMED_CLAUSE = "\\w+\\s*$";
-    private static final Pattern CLAUSE_PATTERN = Pattern.compile("^(.*?)\\s*$");
+
+    /**
+     * Matches a named JPQL/HQL parameter such as {@code :name} or {@code :age}.
+     */
+    private static final Pattern NAMED_PARAM = Pattern.compile(":(\\w+)");
 
     protected final List<Object> parameters = new ArrayList<>();
 
     protected String[] clauses;
     protected QueryOperator operator = AND;
-    protected QueryParamNamer paramNamer = UNNUMBERED;
+    protected QueryParamNamer paramNamer = NUMBERED;
+    protected boolean includeWhereKeyword = false;
 
     public DynamicQuery selectClauses(String... clauses) {
         this.clauses = clauses;
@@ -60,11 +64,12 @@ public class DynamicQuery {
     }
 
     public DynamicQuery paramsFromDto(Object dto, Object... otherParams) {
-        return paramsFromDto(dto, true, otherParams);
+        return paramsFromDto(dto, _ -> true, otherParams);
     }
 
     /**
      * Reads the values from the given DTO.
+     * Note: params() and paramsFromDto() are mutually exclusive — paramsFromDto() resets the parameter list.
      *
      * @param dto         the DTO
      * @param nameFilter  the parameters to be ex- or included by checking the name of a field in the DTO.
@@ -73,9 +78,12 @@ public class DynamicQuery {
      */
     public DynamicQuery paramsFromDto(Object dto, Predicate<String> nameFilter, Object... otherParams) {
         this.parameters.clear();
+        var clauseFields = extractFieldNamesFromClauses();
         var dtoParams = JsonObject.mapFrom(dto).stream()
-                .filter(entry -> nameFilter.test(entry.getKey()))
-                .map(Map.Entry::getValue)
+                // Only include DTO fields that are referenced in a clause; exclude fields not in any clause
+                .filter(entry -> clauseFields.isEmpty() || clauseFields.contains(entry.getKey()))
+                // Filtered-out fields become null so their clause is excluded by validateParams
+                .map(entry -> nameFilter.test(entry.getKey()) ? entry.getValue() : null)
                 .toList();
 
         this.parameters.addAll(dtoParams);
@@ -88,11 +96,8 @@ public class DynamicQuery {
      * <ul>
      * <li>numbered: <code>name = ?1 and age > ?2</code>
      * <li>unnumbered: <code>name = ? and age > ?</code>
-     * <li>named: <code>name = :age and age > :age</code>
+     * <li>named: <code>name = :name and age > :age</code>
      * </ul>
-     *
-     * @param paramNamer
-     * @return
      */
     public DynamicQuery paramNamer(QueryParamNamer paramNamer) {
         this.paramNamer = paramNamer;
@@ -104,86 +109,142 @@ public class DynamicQuery {
         return this;
     }
 
-    public QueryResult build() {
-        var paramCounter = new AtomicInteger(1);
-        var finalQuery = processClauses(paramCounter, (exp, list) -> {
-            list.add("(%s)".formatted(renameParams(exp, paramCounter)));
-        }, this.clauses);
+    /**
+     * Instructs {@link #build()} to prepend {@code where} to the generated condition fragment.
+     */
+    public DynamicQuery withWhere() {
+        this.includeWhereKeyword = true;
+        return this;
+    }
 
-        if (!finalQuery.isBlank()) {
+    public QueryResult build() {
+        var paramCounter = new Counter(1);
+        var finalQuery = processClauses(paramCounter, (exp, list) -> list.add("(%s)".formatted(renameParams(exp, paramCounter))), this.clauses);
+
+        if (this.includeWhereKeyword && !finalQuery.isBlank()) {
             finalQuery = " where " + finalQuery;
         }
 
         return new QueryResult(finalQuery, this.parameters);
     }
 
-    protected String processClauses(AtomicInteger paramCounter, BiConsumer<String, List> consumer, String... clauses) {
-        var validExpressions = new ArrayList<>();
+    protected String processClauses(Counter paramCounter, BiConsumer<String, List<String>> consumer, String... clauses) {
+        var validExpressions = new ArrayList<String>();
         var paramIndex = 0;
 
         for (var clause : clauses) {
-            var matcher = CLAUSE_PATTERN.matcher(clause);
-            while (matcher.find()) {
-                var expression = matcher.group(1).trim();
-                var validationResult = validateParams(expression, paramIndex);
+            var expression = clause.stripTrailing();
+            var validationResult = validateParams(expression, paramIndex);
 
-                if (validationResult.isValid()) {
-                    if (expression.matches(UNNAMED_CLAUSE)) {
-                        validExpressions.add(nameExpression(expression, paramCounter));
-                    } else {
-                        consumer.accept(expression, validExpressions);
-                    }
-                    paramIndex += validationResult.paramCount();
+            if (validationResult.isValid()) {
+                if (isFieldNameOnly(expression)) {
+                    validExpressions.add(nameExpression(expression, paramCounter));
                 } else {
-                    removeNullParams(paramIndex, validationResult.paramCount());
+                    consumer.accept(expression, validExpressions);
                 }
+                paramIndex += validationResult.paramCount();
+            } else {
+                removeNullParams(paramIndex, validationResult.paramCount());
             }
         }
 
         return String.join(this.operator.value, validExpressions.toArray(String[]::new));
     }
 
-    protected String renameParams(String expression, AtomicInteger paramCounter) {
+    protected String renameParams(String expression, Counter paramCounter) {
         return switch (this.paramNamer) {
             case NAMED -> expression;
-            case NUMBERED -> replaceParams(expression, "?%d".formatted(paramCounter.getAndIncrement()));
+            case NUMBERED -> {
+                var matcher = NAMED_PARAM.matcher(expression);
+                var sb = new StringBuffer();
+                while (matcher.find()) {
+                    matcher.appendReplacement(sb, Matcher.quoteReplacement("?%d".formatted(paramCounter.next())));
+                }
+                matcher.appendTail(sb);
+                yield sb.toString();
+            }
             case UNNUMBERED -> replaceParams(expression, "?");
         };
     }
 
-    private String nameExpression(String expression, AtomicInteger paramCounter) {
+    private String nameExpression(String expression, Counter paramCounter) {
         return switch (this.paramNamer) {
             case NAMED -> "%s = %s%s".formatted(expression, this.paramNamer.param, expression);
-            case NUMBERED -> "%s = ?%d".formatted(expression, paramCounter.getAndIncrement());
+            case NUMBERED -> "%s = ?%d".formatted(expression, paramCounter.next());
             case UNNUMBERED -> "%s = %s".formatted(expression, this.paramNamer.param);
         };
     }
 
+    // Distinguishes a bare field name like "age" from a full expression like "age > :age"
+    private static boolean isFieldNameOnly(String expression) {
+        return expression.matches("\\w+");
+    }
+
     private void removeNullParams(int paramIndex, int times) {
-        for (int i = 0; i < times; i++) {
-            this.parameters.remove(paramIndex);
-        }
+        this.parameters.subList(paramIndex, paramIndex + times).clear();
     }
 
     private ValidParamResult validateParams(String expression, int paramIndex) {
-        var paramCounter = 0;
-        var matcher = Pattern.compile(":").matcher(expression);
-        var isValid = paramIndex < this.parameters.size() && this.parameters.get(paramIndex) != null;
+        var matcher = NAMED_PARAM.matcher(expression);
+        var isValid = true;
+        var paramCount = 0;
 
         while (matcher.find()) {
-            paramCounter++;
-            isValid &= this.parameters.get(paramIndex++) != null;
+            var idx = paramIndex + paramCount;
+            isValid &= idx < this.parameters.size() && this.parameters.get(idx) != null;
+            paramCount++;
         }
 
-        return new ValidParamResult(isValid, max(1, paramCounter));
+        if (paramCount == 0) {
+            // No named params — clause uses one implicit/positional parameter
+            isValid = paramIndex < this.parameters.size() && this.parameters.get(paramIndex) != null;
+            paramCount = 1;
+        }
+
+        return new ValidParamResult(isValid, paramCount);
     }
 
     private static String replaceParams(String expression, String replacement) {
-        var result = expression;
-        while (result.contains(":")) {
-            result = result.replaceFirst(":\\w+", replacement);
+        return NAMED_PARAM.matcher(expression).replaceAll(Matcher.quoteReplacement(replacement));
+    }
+
+    /**
+     * Extracts all field names referenced in the current clauses.
+     * Named parameters (":fieldName") and bare field names ("fieldName") are both collected.
+     */
+    private Set<String> extractFieldNamesFromClauses() {
+        if (this.clauses == null || this.clauses.length == 0) {
+            return Set.of();
         }
-        return result;
+        return Arrays.stream(this.clauses)
+                .flatMap(clause -> {
+                    if (isFieldNameOnly(clause)) {
+                        return Stream.of(clause);
+                    }
+                    var matcher = NAMED_PARAM.matcher(clause);
+                    var names = new ArrayList<String>();
+                    while (matcher.find()) {
+                        names.add(matcher.group(1));
+                    }
+                    return names.stream();
+                })
+                .collect(Collectors.toSet());
+    }
+
+    /**
+     * Simple mutable counter used to number query parameters (?1, ?2, …).
+     */
+    protected static final class Counter {
+
+        private int value;
+
+        Counter(int start) {
+            this.value = start;
+        }
+
+        int next() {
+            return this.value++;
+        }
     }
 
     private record ValidParamResult(boolean isValid, int paramCount) {
@@ -199,11 +260,25 @@ public class DynamicQuery {
             this.clauses = clauses;
         }
 
+        @Override
         public UpdateQuery params(Object... params) {
             this.parameters.addAll(Arrays.asList(params));
             return this;
         }
 
+        @Override
+        public UpdateQuery paramsFromDto(Object dto, Object... otherParams) {
+            super.paramsFromDto(dto, otherParams);
+            return this;
+        }
+
+        @Override
+        public UpdateQuery paramsFromDto(Object dto, Predicate<String> nameFilter, Object... otherParams) {
+            super.paramsFromDto(dto, nameFilter, otherParams);
+            return this;
+        }
+
+        @Override
         public UpdateQuery paramNamer(QueryParamNamer namer) {
             this.paramNamer = namer;
             return this;
@@ -220,8 +295,8 @@ public class DynamicQuery {
             }
 
             this.operator = COMMA;
-            var paramCounter = new AtomicInteger(1);
-            BiConsumer<String, List> updateExpAdder = (exp, list) -> list.add(renameParams(exp, paramCounter));
+            var paramCounter = new Counter(1);
+            BiConsumer<String, List<String>> updateExpAdder = (exp, list) -> list.add(renameParams(exp, paramCounter));
             var query = processClauses(paramCounter, updateExpAdder, this.clauses);
 
             if (query.isBlank()) {
@@ -229,7 +304,7 @@ public class DynamicQuery {
             }
 
             var whereQuery = this.whereClause != null ? processClauses(paramCounter, updateExpAdder, this.whereClause) : "";
-            String finalQuery = "SET " + query;
+            var finalQuery = "SET " + query;
             if (!whereQuery.isBlank()) {
                 finalQuery += " WHERE " + whereQuery;
             }
